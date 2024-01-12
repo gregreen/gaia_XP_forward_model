@@ -239,7 +239,8 @@ def train(data_fname, output_dir, stage=0, thin=1, E_low=0.1, n_epochs=512):
     path_list = [
         'data', 'plots',
         'models/prior', 'models/flux',
-        'index', 'hist_loss'
+        'index', 'hist_loss',
+        'checkpoints'
     ]
     for p in path_list:
         Path(os.path.join(output_dir,p)).mkdir(exist_ok=True, parents=True)
@@ -1077,12 +1078,14 @@ def check_train_val_split(d_train, d_val, fname):
         assert np.all(f['val/gdr3_source_id'][:]==d_val['gdr3_source_id'])
 
 
-def execute_recipe(data_fname, output_dir, recipe, thin=1):
+def execute_recipe(data_fname, output_dir, recipe,
+                   thin=1, checkpoint_every=None):
     # Ensure that output directories exist
     path_list = [
         'data', 'plots',
         'models/prior', 'models/flux',
-        'index', 'hist_loss'
+        'index', 'hist_loss',
+        'checkpoints'
     ]
     for p in path_list:
         Path(os.path.join(output_dir,p)).mkdir(exist_ok=True, parents=True)
@@ -1234,6 +1237,11 @@ def execute_recipe(data_fname, output_dir, recipe, thin=1):
 
         # Train
         train_kwargs = get_default_args(train_stellar_model)
+        if checkpoint_every is not None:
+            train_kwargs['checkpoint_every'] = checkpoint_every
+            train_kwargs['checkpoint_base'] = os.path.join(
+                output_dir, f'checkpoints/chkpt_{i:02d}'
+            )
         train_kwargs.update(stage.get('train',{}))
         train_kwargs.update(dict(idx_train=idx_select))
         train_hist = train_stellar_model(
@@ -1500,12 +1508,18 @@ def main():
         default=1,
         help='Only use every Nth star in the training set.'
     )
+    parser.add_argument(
+        '--checkpoint-every',
+        type=int,
+        help='Checkpoint every Nth epoch during each training stage.'
+    )
     args = parser.parse_args()
 
     with open(args.recipe, 'r') as f:
         recipe = json.load(f)
 
-    execute_recipe(args.input, args.output_dir, recipe, thin=args.thin)
+    execute_recipe(args.input, args.output_dir, recipe,
+                   thin=args.thin, checkpoint_every=args.checkpoint_every)
 
     return 0
 

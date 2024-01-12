@@ -33,6 +33,7 @@ import astropy.constants as const
 
 import h5py
 import os
+import shutil
 import json
 from glob import glob
 from tqdm.auto import tqdm
@@ -731,7 +732,9 @@ def train_stellar_model(stellar_model,
                         lr_drop_factor=0.5,
                         model_update=['stellar_model',
                                       'ext_curve_w','ext_curve_b'],
-                        var_update=['atm','E','plx','xi']
+                        var_update=['atm','E','plx','xi'],
+                        checkpoint_base=None,
+                        checkpoint_every=16
                        ):
     
     # Make arrays to hold estimated stellar types
@@ -748,6 +751,7 @@ def train_stellar_model(stellar_model,
     n_sel = len(idx_train)
     print(f'Training on {n_sel} ({n_sel/n_train*100:.2f}%) sources.')
     batches, n_batches = get_batch_iterator(idx_train, batch_size, n_epochs)
+    checkpoint_every_steps = int(checkpoint_every*n_batches/n_epochs)
 
     # Optimizer for stellar model and extinction curve
     n_segments = lr_n_drops + 1
@@ -840,13 +844,59 @@ def train_stellar_model(stellar_model,
     stellar_loss_hist = []
     model_lr_hist = []
     stellar_lr_hist = []
-    chi_w1_hist = []
-    chi_w2_hist = []
     slope_record = []
     bias_record = []
 
+    step = tf.Variable(0, dtype=tf.int64)
+
+    # Checkpointing
+    if checkpoint_base is not None:
+        chkpt_fn = checkpoint_base + '_model'
+        chkpt_data_fn = checkpoint_base + '_data.h5'
+
+        checkpoint = tf.train.Checkpoint(
+            opt_model=opt_model,
+            opt_st_params=opt_st_params,
+            stellar_model=stellar_model,
+            step=step
+        )
+
+        # Look for existing checkpoint
+        if os.path.exists(chkpt_fn+'.index'):
+            print(f'Restoring from {chkpt_fn} ...')
+            checkpoint.read(chkpt_fn)
+            print(f'Restarting from step {int(step)}.')
+
+            print(f'Restoring stellar parameters from {chkpt_data_fn} ...')
+            with h5py.File(chkpt_data_fn, 'r') as f:
+                if optimize_stellar_params:
+                    # Load stellar data
+                    if 'atm' in var_update:
+                        type_est[idx_train] = f['type_est'][:]
+                    if 'E' in var_update:
+                        ln_ext_est[idx_train] = f['ln_ext_est'][:]
+                    if 'plx' in var_update:
+                        ln_plx_est[idx_train] = f['ln_plx_est'][:]
+                    if 'xi' in var_update:
+                        xi_est[idx_train] = f['xi_est'][:]
+                    # Load stellar loss/lr histories
+                    stellar_loss_hist = list(f['stellar_loss_hist'][:])
+                    stellar_lr_hist = list(f['stellar_lr_hist'][:])
+                
+                if optimize_stellar_model:
+                    # Load model loss/lr histories
+                    model_loss_hist = list(f['model_loss_hist'][:])
+                    model_lr_hist = list(f['model_lr_hist'][:])
+                    # Load extinction bias/slope histories
+                    slope_record = list(f['slope_record'][:])
+                    bias_record = list(f['bias_record'][:])
+
     pbar = tqdm(enumerate(batches), total=n_batches)
     for i,b in pbar:
+        if i < step:
+            # Skip over completed steps
+            continue
+
         # Load in data for this batch
         idx = b.numpy()
 
@@ -904,14 +954,6 @@ def train_stellar_model(stellar_model,
                     print('  * NaN {key}? {np.any(np.isnan(v))}')
                     raise ValueError('NaN model loss')
 
-            chi_w1, chi_w2 = chi_band(stellar_model, 
-                            #tf.constant(np.array([64, 65], dtype='int')), 
-                            type_est_batch, xi_est_batch, 
-                            ext_est_batch, plx_est_batch,
-                            flux_batch, flux_err_batch,
-            ).T
-            chi_w1_hist.append(np.mean(chi_w1))
-            chi_w2_hist.append(np.mean(chi_w2))
             slope_record.append(stellar_model._ext_slope.numpy()[0])
             bias_record.append(stellar_model._ext_bias.numpy()[0])
             model_lr_hist.append(float(lr_model(i).numpy()))
@@ -968,6 +1010,53 @@ def train_stellar_model(stellar_model,
             ln_ext_est[idx] = ln_ext_est_batch.numpy()
             ln_plx_est[idx] = ln_plx_est_batch.numpy()
 
+        # Checkpoint
+        if checkpoint_base is not None:
+            if i % checkpoint_every_steps == checkpoint_every_steps-1:
+                step.assign(i)
+
+                # Save model parameters, optimizers and step number
+                checkpoint.write(chkpt_fn+'.tmp')
+
+                # Save data
+                with h5py.File(chkpt_data_fn+'.tmp', 'w') as f:
+                    if optimize_stellar_params:
+                        # Save stellar data
+                        if 'atm' in var_update:
+                            f['type_est'] = type_est[idx_train]
+                        if 'E' in var_update:
+                            f['ln_ext_est'] = ln_ext_est[idx_train] 
+                        if 'plx' in var_update:
+                            f['ln_plx_est'] = ln_plx_est[idx_train]
+                        if 'xi' in var_update:
+                            f['xi_est'] = xi_est[idx_train]
+                        # Save stellar loss/lr histories
+                        f['stellar_loss_hist'] = np.array(stellar_loss_hist,
+                                                          dtype='f4')
+                        f['stellar_lr_hist'] = np.array(stellar_lr_hist,
+                                                        dtype='f4')
+                    if optimize_stellar_model:
+                        # Save model loss/lr histories
+                        f['model_loss_hist'] = np.array(model_loss_hist,
+                                                        dtype='f4')
+                        f['model_lr_hist'] = np.array(model_lr_hist,
+                                                      dtype='f4')
+                        # Save extinction bias/slope histories
+                        f['slope_record'] = np.vstack(slope_record)
+                        f['bias_record'] = np.vstack(bias_record)
+
+                # Remove .tmp from checkpoint filenames.
+                # We first write to .tmp files and then rename them at the
+                # end, so that the previous checkpoint will not be corupted
+                # if the process is killed while the new checkpoint is being
+                # written.
+                fn_src = glob(chkpt_fn+'.tmp*')
+                fn_dest = [chkpt_fn+fn[len(chkpt_fn+'.tmp'):]
+                           for fn in fn_src]
+                for fn0,fn1 in zip(fn_src,fn_dest):
+                    shutil.move(fn0, fn1)
+                shutil.move(chkpt_data_fn+'.tmp', chkpt_data_fn)
+
         # Display losses in progress bar
         pbar.set_postfix(pbar_disp)
 
@@ -975,8 +1064,6 @@ def train_stellar_model(stellar_model,
 
     if optimize_stellar_model:
         ret['model_loss'] = model_loss_hist
-        ret['chi_w1'] = chi_w1_hist
-        ret['chi_w2'] = chi_w2_hist
         ret['ext_slope'] = np.vstack(slope_record)
         ret['ext_bias'] = np.vstack(bias_record)
         ret['model_lr'] = model_lr_hist
@@ -987,8 +1074,6 @@ def train_stellar_model(stellar_model,
         d_train['xi_est'] = xi_est
         d_train['stellar_ext_est'] = np.exp(ln_ext_est)
         d_train['plx_est'] = np.exp(ln_plx_est)
-        ret['chi_w1'] = chi_w1_hist
-        ret['chi_w2'] = chi_w2_hist
         ret['stellar_lr'] = stellar_lr_hist
 
     return ret
